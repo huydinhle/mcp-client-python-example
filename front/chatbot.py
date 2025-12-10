@@ -22,8 +22,17 @@ class Chatbot:
                     with st.chat_message("assistant"):
                         st.write(f"Called tool: {self.current_tool_call['name']}:")
                         
+                        # Handle both Bedrock format (string) and Anthropic format (list)
+                        if isinstance(content["content"], str):
+                            # Bedrock format: content is a plain string
+                            tool_content = content["content"]
+                        elif isinstance(content["content"], list):
+                            # Anthropic format: content is a list of dicts
+                            tool_content = content["content"][0]["text"]
+                        else:
+                            tool_content = str(content["content"])
+                        
                         # Try to parse as JSON, otherwise display as text
-                        tool_content = content["content"][0]["text"]
                         try:
                             parsed_content = json.loads(tool_content)
                             st.json(

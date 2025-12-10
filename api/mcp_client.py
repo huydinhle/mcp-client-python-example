@@ -7,9 +7,7 @@ from mcp.client.stdio import stdio_client
 from datetime import datetime
 import json
 import os
-
-from anthropic import Anthropic
-from anthropic.types import Message
+import boto3
 
 
 class MCPClient:
@@ -18,12 +16,14 @@ class MCPClient:
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
         
-        # Get API key from environment
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
+        # Initialize AWS Bedrock client
+        aws_region = os.getenv("AWS_REGION", "us-west-2")
+        self.llm = boto3.client(
+            service_name='bedrock-runtime',
+            region_name=aws_region
+        )
+        self.model_id = os.getenv("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         
-        self.llm = Anthropic(api_key=api_key)
         self.tools = []
         self.messages = []
         self.logger = logger
@@ -139,18 +139,74 @@ class MCPClient:
             self.logger.debug(f"Error details: {traceback.format_exc()}")
             raise Exception(f"Failed to get tools: {str(e)}")
 
-    async def call_llm(self) -> Message:
-        """Call the LLM with the given query"""
+    async def call_llm(self):
+        """Call the LLM via AWS Bedrock"""
         try:
-            return self.llm.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=8192,
-                messages=self.messages,
-                tools=self.tools,
+            # Prepare the request body for Bedrock
+            request_body = {
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 8192,
+                "messages": self.messages,
+            }
+            
+            # Add tools if available
+            if self.tools:
+                request_body["tools"] = self.tools
+            
+            # Call Bedrock
+            response = self.llm.invoke_model(
+                modelId=self.model_id,
+                body=json.dumps(request_body)
             )
+            
+            # Parse response
+            response_body = json.loads(response['body'].read())
+            
+            # Create a simple object to mimic Anthropic's Message type
+            class BedrockResponse:
+                def __init__(self, response_data):
+                    self.content = []
+                    self.stop_reason = response_data.get('stop_reason')
+                    self.id = response_data.get('id')
+                    
+                    # Convert content to match Anthropic's format
+                    for item in response_data.get('content', []):
+                        if item['type'] == 'text':
+                            self.content.append(type('TextBlock', (), {
+                                'type': 'text',
+                                'text': item['text']
+                            })())
+                        elif item['type'] == 'tool_use':
+                            self.content.append(type('ToolUseBlock', (), {
+                                'type': 'tool_use',
+                                'id': item['id'],
+                                'name': item['name'],
+                                'input': item['input']
+                            })())
+                
+                def to_dict(self):
+                    content_list = []
+                    for c in self.content:
+                        if c.type == 'text':
+                            content_list.append({
+                                'type': 'text',
+                                'text': c.text
+                            })
+                        elif c.type == 'tool_use':
+                            content_list.append({
+                                'type': 'tool_use',
+                                'id': c.id,
+                                'name': c.name,
+                                'input': c.input
+                            })
+                    return {'content': content_list}
+            
+            return BedrockResponse(response_body)
+            
         except Exception as e:
-            self.logger.error(f"Failed to call LLM: {str(e)}")
-            raise Exception(f"Failed to call LLM: {str(e)}")
+            self.logger.error(f"Failed to call LLM via Bedrock: {str(e)}")
+            self.logger.debug(f"Error details: {traceback.format_exc()}")
+            raise Exception(f"Failed to call LLM via Bedrock: {str(e)}")
 
     async def process_query(self, query: str):
         """Process a query using Claude and available tools, returning all messages at the end"""
@@ -211,28 +267,26 @@ class MCPClient:
                             result = await self.session.call_tool(tool_name, tool_args)
                             self.logger.info(f"Tool result: {result}")
                             
-                            # Convert MCP tool result content to Claude-compatible format
-                            # Claude only accepts: text, image, document, search_result
-                            # MCP may return: TextContent, ImageContent, EmbeddedResource
-                            claude_content = []
+                            # Convert MCP tool result content to Bedrock-compatible format
+                            # Bedrock expects simpler format for tool results
+                            result_text_parts = []
                             for item in result.content:
                                 if hasattr(item, 'type'):
                                     if item.type == 'text':
-                                        # Text content is directly compatible
-                                        claude_content.append({"type": "text", "text": item.text})
+                                        result_text_parts.append(item.text)
                                     elif item.type == 'resource':
                                         # EmbeddedResource needs to be converted to text
                                         if hasattr(item, 'resource') and hasattr(item.resource, 'text'):
-                                            claude_content.append({"type": "text", "text": item.resource.text})
+                                            result_text_parts.append(item.resource.text)
                                         elif hasattr(item, 'resource'):
-                                            # Fallback: convert resource to string
-                                            claude_content.append({"type": "text", "text": str(item.resource)})
+                                            result_text_parts.append(str(item.resource))
                                     else:
-                                        # For other types, try to convert to text
-                                        claude_content.append({"type": "text", "text": str(item)})
+                                        result_text_parts.append(str(item))
                                 else:
-                                    # If no type attribute, convert to string
-                                    claude_content.append({"type": "text", "text": str(item)})
+                                    result_text_parts.append(str(item))
+                            
+                            # Combine all text parts into a single string
+                            combined_result = "\n".join(result_text_parts)
                             
                             tool_result_message = {
                                 "role": "user",
@@ -240,7 +294,7 @@ class MCPClient:
                                     {
                                         "type": "tool_result",
                                         "tool_use_id": tool_use_id,
-                                        "content": claude_content,
+                                        "content": combined_result,
                                     }
                                 ],
                             }

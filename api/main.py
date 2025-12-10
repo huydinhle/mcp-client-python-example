@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     serper_api_key: str = ""
     github_personal_access_token: str = ""
     github_host: str = ""
+    aws_region: str = "us-west-2"
+    bedrock_model_id: str = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
     class Config:
         env_file = ".env"
