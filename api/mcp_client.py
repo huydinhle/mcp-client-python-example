@@ -41,17 +41,20 @@ class MCPClient:
         """Connect to an MCP server
 
         Args:
-            server_script_path: Path to the server script (.py or .js)
+            server_script_path: Path to the server script (.py, .js, or binary executable)
         """
         try:
             is_python = server_script_path.endswith(".py")
             is_js = server_script_path.endswith(".js")
-            if not (is_python or is_js):
-                raise ValueError("Server script must be a .py or .js file")
+            is_executable = os.access(server_script_path, os.X_OK)
 
             self.logger.info(
                 f"Attempting to connect to server using script: {server_script_path}"
             )
+            
+            # Prepare environment variables for the MCP server
+            # Include all environment variables it might need
+            server_env = os.environ.copy()
             
             # Check if the server uses uv (has pyproject.toml or uv.lock)
             server_dir = os.path.dirname(server_script_path)
@@ -63,19 +66,40 @@ class MCPClient:
                 # Use uv run for uv-based projects (run from server directory)
                 command = "uv"
                 args = ["run", server_filename]
-                env = {"UV_PROJECT_ENVIRONMENT": os.path.join(server_dir, ".venv")}
+                server_env["UV_PROJECT_ENVIRONMENT"] = os.path.join(server_dir, ".venv")
                 self.logger.info(f"Detected uv project, using 'uv run' from {server_dir}")
-                # StdioServerParameters will use server_dir as cwd
                 server_params = StdioServerParameters(
-                    command=command, args=args, env=env, cwd=server_dir
+                    command=command, args=args, env=server_env, cwd=server_dir
                 )
-            else:
+            elif is_executable and not is_python and not is_js:
+                # Binary executable (like github-mcp-server)
+                command = server_script_path
+                # GitHub MCP server requires 'stdio' subcommand
+                if 'github' in server_filename.lower():
+                    args = ["stdio"]
+                    # Add gh-host flag if GitHub Enterprise (needs full URL with https://)
+                    github_host = os.getenv("GITHUB_HOST", "")
+                    if github_host and "github.com" not in github_host:
+                        # Ensure it has a scheme
+                        if not github_host.startswith(("http://", "https://")):
+                            github_host = f"https://{github_host}"
+                        args.extend(["--gh-host", github_host])
+                    self.logger.info(f"Detected GitHub MCP server binary with args: {args}")
+                else:
+                    args = []
+                    self.logger.info(f"Detected binary executable: {server_filename}")
+                server_params = StdioServerParameters(
+                    command=command, args=args, env=server_env
+                )
+            elif is_python or is_js:
                 # Use standard python or node
                 command = "python" if is_python else "node"
                 args = [server_script_path]
                 server_params = StdioServerParameters(
-                    command=command, args=args, env=None
+                    command=command, args=args, env=server_env
                 )
+            else:
+                raise ValueError(f"Server path must be a .py, .js, or executable file: {server_script_path}")
 
             stdio_transport = await self.exit_stack.enter_async_context(
                 stdio_client(server_params)
@@ -119,8 +143,8 @@ class MCPClient:
         """Call the LLM with the given query"""
         try:
             return self.llm.messages.create(
-                model="claude-3-haiku-20240307",
-                max_tokens=4096,
+                model="claude-sonnet-4-20250514",
+                max_tokens=8192,
                 messages=self.messages,
                 tools=self.tools,
             )
@@ -186,14 +210,37 @@ class MCPClient:
                             # turn this one return a simple string
                             result = await self.session.call_tool(tool_name, tool_args)
                             self.logger.info(f"Tool result: {result}")
-                            # result = test_tool_result_content
+                            
+                            # Convert MCP tool result content to Claude-compatible format
+                            # Claude only accepts: text, image, document, search_result
+                            # MCP may return: TextContent, ImageContent, EmbeddedResource
+                            claude_content = []
+                            for item in result.content:
+                                if hasattr(item, 'type'):
+                                    if item.type == 'text':
+                                        # Text content is directly compatible
+                                        claude_content.append({"type": "text", "text": item.text})
+                                    elif item.type == 'resource':
+                                        # EmbeddedResource needs to be converted to text
+                                        if hasattr(item, 'resource') and hasattr(item.resource, 'text'):
+                                            claude_content.append({"type": "text", "text": item.resource.text})
+                                        elif hasattr(item, 'resource'):
+                                            # Fallback: convert resource to string
+                                            claude_content.append({"type": "text", "text": str(item.resource)})
+                                    else:
+                                        # For other types, try to convert to text
+                                        claude_content.append({"type": "text", "text": str(item)})
+                                else:
+                                    # If no type attribute, convert to string
+                                    claude_content.append({"type": "text", "text": str(item)})
+                            
                             tool_result_message = {
                                 "role": "user",
                                 "content": [
                                     {
                                         "type": "tool_result",
                                         "tool_use_id": tool_use_id,
-                                        "content": result.content,
+                                        "content": claude_content,
                                     }
                                 ],
                             }

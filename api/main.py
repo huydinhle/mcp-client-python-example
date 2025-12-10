@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     server_script_path: str
     anthropic_api_key: str = ""
     serper_api_key: str = ""
+    github_personal_access_token: str = ""
+    github_host: str = ""
 
     class Config:
         env_file = ".env"
