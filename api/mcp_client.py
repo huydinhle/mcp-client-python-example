@@ -13,7 +13,7 @@ import boto3
 class MCPClient:
     def __init__(self):
         # Initialize session and client objects
-        self.session: Optional[ClientSession] = None
+        self.sessions: dict[str, ClientSession] = {}  # Multiple sessions by server name
         self.exit_stack = AsyncExitStack()
         
         # Initialize AWS Bedrock client
@@ -25,13 +25,23 @@ class MCPClient:
         self.model_id = os.getenv("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         
         self.tools = []
+        self.tool_to_server = {}  # Map tool names to server names
         self.messages = []
         self.logger = logger
 
     async def call_tool(self, tool_name: str, tool_args: dict):
         """Call a tool with the given name and arguments"""
         try:
-            result = await self.session.call_tool(tool_name, tool_args)
+            # Find which server owns this tool
+            server_name = self.tool_to_server.get(tool_name)
+            if not server_name:
+                raise Exception(f"Tool '{tool_name}' not found in any connected server")
+            
+            session = self.sessions.get(server_name)
+            if not session:
+                raise Exception(f"Server '{server_name}' is not connected")
+            
+            result = await session.call_tool(tool_name, tool_args)
             return result
         except Exception as e:
             self.logger.error(f"Failed to call tool: {str(e)}")
@@ -104,13 +114,20 @@ class MCPClient:
             stdio_transport = await self.exit_stack.enter_async_context(
                 stdio_client(server_params)
             )
-            self.stdio, self.write = stdio_transport
-            self.session = await self.exit_stack.enter_async_context(
-                ClientSession(self.stdio, self.write)
+            stdio, write = stdio_transport
+            session = await self.exit_stack.enter_async_context(
+                ClientSession(stdio, write)
             )
 
-            await self.session.initialize()
-            mcp_tools = await self.get_mcp_tools()
+            await session.initialize()
+            
+            # Store session for backward compatibility
+            self.session = session
+            
+            # Get tools from this server
+            response = await session.list_tools()
+            mcp_tools = response.tools
+            
             self.tools = [
                 {
                     "name": tool.name,
@@ -128,12 +145,124 @@ class MCPClient:
             self.logger.debug(f"Connection error details: {traceback.format_exc()}")
             raise Exception(f"Failed to connect to server: {str(e)}")
 
+    async def connect_to_multiple_servers(self, server_configs: list[dict]):
+        """Connect to multiple MCP servers
+        
+        Args:
+            server_configs: List of server configs with format:
+                [
+                    {"name": "github", "path": "/path/to/server", "args": [], "enabled": True},
+                    {"name": "filesystem", "path": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path"], "enabled": True}
+                ]
+        """
+        all_tools = []
+        connected_servers = []
+        
+        for config in server_configs:
+            if not config.get("enabled", True):
+                self.logger.info(f"Skipping disabled server: {config['name']}")
+                continue
+                
+            try:
+                server_name = config["name"]
+                server_path = config["path"]
+                server_args = config.get("args", [])
+                
+                self.logger.info(f"Connecting to {server_name} MCP server...")
+                
+                # Prepare server parameters
+                server_env = os.environ.copy()
+                server_env["GITHUB_PERSONAL_ACCESS_TOKEN"] = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+                server_env["GITHUB_HOST"] = os.getenv("GITHUB_HOST", "")
+                
+                # Handle different server types
+                if server_path == "npx":
+                    # NPX-based server (like filesystem)
+                    command = "npx"
+                    args = server_args
+                elif os.path.isfile(server_path) and os.access(server_path, os.X_OK):
+                    # Binary executable
+                    command = server_path
+                    args = server_args
+                elif server_path.endswith(".py"):
+                    # Python script
+                    command = "python"
+                    args = [server_path] + server_args
+                elif server_path.endswith(".js"):
+                    # Node script
+                    command = "node"
+                    args = [server_path] + server_args
+                else:
+                    self.logger.warning(f"Unknown server type for {server_name}, skipping")
+                    continue
+                
+                server_params = StdioServerParameters(
+                    command=command,
+                    args=args,
+                    env=server_env
+                )
+                
+                # Connect to server
+                stdio_transport = await self.exit_stack.enter_async_context(
+                    stdio_client(server_params)
+                )
+                stdio, write = stdio_transport
+                session = await self.exit_stack.enter_async_context(
+                    ClientSession(stdio, write)
+                )
+                
+                await session.initialize()
+                
+                # Store session
+                self.sessions[server_name] = session
+                
+                # Get tools from this server
+                response = await session.list_tools()
+                mcp_tools = response.tools
+                
+                server_tools = []
+                for tool in mcp_tools:
+                    tool_dict = {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.inputSchema,
+                    }
+                    server_tools.append(tool_dict)
+                    all_tools.append(tool_dict)
+                    # Map tool to server
+                    self.tool_to_server[tool.name] = server_name
+                
+                self.logger.info(
+                    f"✅ Connected to {server_name} MCP server. Tools: {[t['name'] for t in server_tools]}"
+                )
+                connected_servers.append(server_name)
+                
+            except Exception as e:
+                self.logger.error(f"Failed to connect to {config['name']} server: {str(e)}")
+                self.logger.debug(f"Error details: {traceback.format_exc()}")
+                # Continue to next server instead of failing completely
+        
+        if not connected_servers:
+            raise Exception("Failed to connect to any MCP servers")
+        
+        self.tools = all_tools
+        self.logger.info(f"✅ Successfully connected to {len(connected_servers)} server(s): {connected_servers}")
+        self.logger.info(f"Total tools available: {len(all_tools)}")
+        return True
+
     async def get_mcp_tools(self):
+        """Get all tools from all connected MCP servers"""
         try:
-            self.logger.info("Requesting MCP tools from the server.")
-            response = await self.session.list_tools()
-            tools = response.tools
-            return tools
+            self.logger.info("Requesting MCP tools from all connected servers.")
+            # Tools are already collected during connection
+            # Just return them in a compatible format
+            class ToolWrapper:
+                def __init__(self, tool_dict):
+                    self.name = tool_dict["name"]
+                    self.description = tool_dict["description"]
+                    self.inputSchema = tool_dict["input_schema"]
+            
+            return [ToolWrapper(tool) for tool in self.tools]
         except Exception as e:
             self.logger.error(f"Failed to get MCP tools: {str(e)}")
             self.logger.debug(f"Error details: {traceback.format_exc()}")
@@ -263,8 +392,8 @@ class MCPClient:
                             f"Executing tool: {tool_name} with args: {tool_args}"
                         )
                         try:
-                            # turn this one return a simple string
-                            result = await self.session.call_tool(tool_name, tool_args)
+                            # Call tool through the routing method
+                            result = await self.call_tool(tool_name, tool_args)
                             self.logger.info(f"Tool result: {result}")
                             
                             # Convert MCP tool result content to Bedrock-compatible format

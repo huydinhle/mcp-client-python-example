@@ -10,11 +10,23 @@ from pydantic_settings import BaseSettings
 load_dotenv()
 
 class Settings(BaseSettings):
-    server_script_path: str
+    # Legacy single server config (backward compatibility)
+    server_script_path: str = ""
+    
+    # MCP Server configurations
+    mcp_github_enabled: bool = True
+    mcp_github_path: str = ""
+    mcp_filesystem_enabled: bool = False
+    mcp_filesystem_path: str = "npx"
+    mcp_filesystem_args: str = ""  # Comma-separated args
+    
+    # API keys and credentials
     anthropic_api_key: str = ""
     serper_api_key: str = ""
     github_personal_access_token: str = ""
     github_host: str = ""
+    
+    # AWS Bedrock
     aws_region: str = "us-west-2"
     bedrock_model_id: str = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
@@ -29,9 +41,49 @@ async def lifespan(app: FastAPI):
     # Startup
     client = MCPClient()
     try:
-        connected = await client.connect_to_server(settings.server_script_path)
-        if not connected:
-            raise Exception("Failed to connect to server")
+        # Build server configurations
+        server_configs = []
+        
+        # GitHub MCP Server
+        if settings.mcp_github_enabled and settings.mcp_github_path:
+            github_args = ["stdio"]
+            if settings.github_host:
+                github_args.extend(["--gh-host", f"https://{settings.github_host}" if not settings.github_host.startswith("http") else settings.github_host])
+            
+            server_configs.append({
+                "name": "github",
+                "path": settings.mcp_github_path,
+                "args": github_args,
+                "enabled": True
+            })
+        
+        # Filesystem MCP Server
+        if settings.mcp_filesystem_enabled and settings.mcp_filesystem_path:
+            fs_args = []
+            if settings.mcp_filesystem_args:
+                # Parse comma-separated args
+                fs_args = [arg.strip() for arg in settings.mcp_filesystem_args.split(",")]
+            
+            server_configs.append({
+                "name": "filesystem",
+                "path": settings.mcp_filesystem_path,
+                "args": fs_args,
+                "enabled": True
+            })
+        
+        # Fallback to legacy single server config if no new configs
+        if not server_configs and settings.server_script_path:
+            connected = await client.connect_to_server(settings.server_script_path)
+            if not connected:
+                raise Exception("Failed to connect to server")
+        elif server_configs:
+            # Connect to multiple servers
+            connected = await client.connect_to_multiple_servers(server_configs)
+            if not connected:
+                raise Exception("Failed to connect to any servers")
+        else:
+            raise Exception("No MCP servers configured. Set MCP_GITHUB_PATH or MCP_FILESYSTEM_PATH in .env")
+        
         app.state.client = client
         yield
     except Exception as e:
