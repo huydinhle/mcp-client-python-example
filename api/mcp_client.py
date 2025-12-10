@@ -17,7 +17,13 @@ class MCPClient:
         # Initialize session and client objects
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
-        self.llm = Anthropic()
+        
+        # Get API key from environment
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
+        
+        self.llm = Anthropic(api_key=api_key)
         self.tools = []
         self.messages = []
         self.logger = logger
@@ -46,10 +52,30 @@ class MCPClient:
             self.logger.info(
                 f"Attempting to connect to server using script: {server_script_path}"
             )
-            command = "python" if is_python else "node"
-            server_params = StdioServerParameters(
-                command=command, args=[server_script_path], env=None
-            )
+            
+            # Check if the server uses uv (has pyproject.toml or uv.lock)
+            server_dir = os.path.dirname(server_script_path)
+            server_filename = os.path.basename(server_script_path)
+            has_pyproject = os.path.exists(os.path.join(server_dir, "pyproject.toml"))
+            has_uv_lock = os.path.exists(os.path.join(server_dir, "uv.lock"))
+            
+            if is_python and (has_pyproject or has_uv_lock):
+                # Use uv run for uv-based projects (run from server directory)
+                command = "uv"
+                args = ["run", server_filename]
+                env = {"UV_PROJECT_ENVIRONMENT": os.path.join(server_dir, ".venv")}
+                self.logger.info(f"Detected uv project, using 'uv run' from {server_dir}")
+                # StdioServerParameters will use server_dir as cwd
+                server_params = StdioServerParameters(
+                    command=command, args=args, env=env, cwd=server_dir
+                )
+            else:
+                # Use standard python or node
+                command = "python" if is_python else "node"
+                args = [server_script_path]
+                server_params = StdioServerParameters(
+                    command=command, args=args, env=None
+                )
 
             stdio_transport = await self.exit_stack.enter_async_context(
                 stdio_client(server_params)
@@ -93,8 +119,8 @@ class MCPClient:
         """Call the LLM with the given query"""
         try:
             return self.llm.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=1000,
+                model="claude-3-haiku-20240307",
+                max_tokens=4096,
                 messages=self.messages,
                 tools=self.tools,
             )
@@ -109,6 +135,9 @@ class MCPClient:
                 f"Processing new query: {query[:100]}..."
             )  # Log first 100 chars of query
 
+            # Clear previous conversation history for independent queries
+            self.messages = []
+            
             # Add the initial user message
             user_message = {"role": "user", "content": query}
             self.messages.append(user_message)

@@ -21,14 +21,24 @@ class Chatbot:
                 if content["type"] == "tool_result":
                     with st.chat_message("assistant"):
                         st.write(f"Called tool: {self.current_tool_call['name']}:")
-                        st.json(
-                            {
-                                "name": self.current_tool_call["name"],
-                                "args": self.current_tool_call["args"],
-                                "content": json.loads(content["content"][0]["text"]),
-                            },
-                            expanded=False,
-                        )
+                        
+                        # Try to parse as JSON, otherwise display as text
+                        tool_content = content["content"][0]["text"]
+                        try:
+                            parsed_content = json.loads(tool_content)
+                            st.json(
+                                {
+                                    "name": self.current_tool_call["name"],
+                                    "args": self.current_tool_call["args"],
+                                    "content": parsed_content,
+                                },
+                                expanded=False,
+                            )
+                        except (json.JSONDecodeError, ValueError):
+                            # Display as text if not valid JSON
+                            st.info(f"**Tool:** {self.current_tool_call['name']}")
+                            st.code(f"Args: {self.current_tool_call['args']}", language="python")
+                            st.text_area("Result:", tool_content, height=150)
 
         # display ai message
         if message["role"] == "assistant" and type(message["content"]) == str:

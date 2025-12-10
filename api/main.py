@@ -10,7 +10,13 @@ from pydantic_settings import BaseSettings
 load_dotenv()
 
 class Settings(BaseSettings):
-    server_script_path: str = "/Users/alejandro/repos/code/mcp/documentation/main.py"
+    server_script_path: str
+    anthropic_api_key: str = ""
+    serper_api_key: str = ""
+
+    class Config:
+        env_file = ".env"
+        extra = "ignore"  # Ignore extra fields in .env
 
 settings = Settings()
 
